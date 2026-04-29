@@ -44,7 +44,7 @@ import gspread
 import pandas as pd
 
 # Using the renamed 'gc' variable
-src_sheet = gc.open_by_url("https://docs.google.com/spreadsheets/d/11xYsqz7kGkYQXkGM0i3KphCv7mzOTU-sgZqf0I5kM7o/edit?gid=1132808858#gid=1132808858")
+src_sheet = gc.open_by_url("### Provide gsheet link containing data downloaded from kaggle. ###")
 required_sheet_name = 'train'
 worksheet = src_sheet.worksheet(required_sheet_name)
 data = pd.DataFrame()
