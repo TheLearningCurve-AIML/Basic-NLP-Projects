@@ -1,0 +1,303 @@
+"""
+**Colab Notebook**
+
+**Hardware Accelerator : v5e-1 TPU**
+"""
+
+!pip install fuzzywuzzy
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import os
+from google.cloud import storage
+import joblib
+from sklearn.feature_extraction .text import CountVectorizer
+from fuzzywuzzy import fuzz
+from nltk.stem import PorterStemmer
+
+from google.colab import auth
+auth.authenticate_user()
+
+import gspread
+import google.auth
+
+# Define all required scopes for both gspread and Vertex AI
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets"
+]
+
+creds, _ = google.auth.default()
+gc = gspread.authorize(creds)
+
+import gspread
+import pandas as pd
+
+# Using the renamed 'gc' variable
+src_sheet = gc.open_by_url("### Provide gsheet link containing data downloaded from kaggle. ###")
+required_sheet_name = 'train'
+worksheet = src_sheet.worksheet(required_sheet_name)
+data = pd.DataFrame()
+if worksheet:
+    # Directly fetch data using gspread and convert to DataFrame
+    data = pd.DataFrame(worksheet.get_all_records())
+else:
+    print(f"Sheet '{required_sheet_name}' not found.")
+
+# Since we have only small RAM, We are selecting few records for training.
+# To train model on full data we need 65 GB of RAM.
+data = data.sample(n=100000)
+
+data.duplicated().sum()
+
+data.isnull().sum()
+
+(data['is_duplicate'].value_counts()/data['is_duplicate'].count())*100
+
+"""**Basic Feature Implementaion**"""
+
+def CommonWords(row):
+  w1 = set(map(lambda word: word.lower().strip(), row["question1"].split(" ")))
+  w2 = set(map(lambda word: word.lower().strip(), row["question2"].split(" ")))
+  return len(w1 & w2)
+
+def total_words(row):
+  w1 = set(map(lambda word: word.lower().strip(), row["question1"].split(" ")))
+  w2 = set(map(lambda word: word.lower().strip(), row["question2"].split(" ")))
+  return (len(w1) + len(w2))
+
+def fetch_token_features(row):
+    q1 = row['question1']
+    q2 = row['question2']
+    SAFE_DIV = 0.0001
+
+    # Manual Stopwords to avoid internet download error
+    STOP_WORDS = {"a", "an", "the", "and", "or", "but", "if", "because", "as", "until", "while", "of", "at", "by", "for", "with", "about", "against", "between", "into", "through", "during", "before", "after", "above", "below", "to", "from", "up", "down", "in", "out", "on", "off", "over", "under", "again", "further", "then", "once", "here", "there", "when", "where", "why", "how", "all", "any", "both", "each", "few", "more", "most", "other", "some", "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "s", "t", "can", "will", "just", "don", "should", "now", "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", "yours", "yourself", "yourselves", "he", "him", "his", "himself", "she", "her", "hers", "herself", "it", "its", "itself", "they", "them", "their", "theirs", "themselves", "what", "which", "who", "whom", "this", "that", "these", "those", "am", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "having", "do", "does", "did", "doing"}
+
+    token_features = [0.0]*8
+    q1_tokens = str(q1).split()
+    q2_tokens = str(q2).split()
+
+    if len(q1_tokens) == 0 or len(q2_tokens) == 0:
+        return token_features
+
+    q1_words = set([word for word in q1_tokens if word not in STOP_WORDS])
+    q2_words = set([word for word in q2_tokens if word not in STOP_WORDS])
+    q1_stops = set([word for word in q1_tokens if word in STOP_WORDS])
+    q2_stops = set([word for word in q2_tokens if word in STOP_WORDS])
+
+    common_word_count = len(q1_words.intersection(q2_words))
+    common_stop_count = len(q1_stops.intersection(q2_stops))
+    common_token_count = len(set(q1_tokens).intersection(set(q2_tokens)))
+
+    token_features[0] = common_word_count / (min(len(q1_words), len(q2_words)) + SAFE_DIV)
+    token_features[1] = common_word_count / (max(len(q1_words), len(q2_words)) + SAFE_DIV)
+    token_features[2] = common_stop_count / (min(len(q1_stops), len(q2_stops)) + SAFE_DIV)
+    token_features[3] = common_stop_count / (max(len(q1_stops), len(q2_stops)) + SAFE_DIV)
+    token_features[4] = common_token_count / (min(len(q1_tokens), len(q2_tokens)) + SAFE_DIV)
+    token_features[5] = common_token_count / (max(len(q1_tokens), len(q2_tokens)) + SAFE_DIV)
+    token_features[6] = int(q1_tokens[-1] == q2_tokens[-1])
+    token_features[7] = int(q1_tokens[0] == q2_tokens[0])
+
+    return token_features
+
+def apply_basic_feature(data):
+    # Lower the character
+    data['q1_len'] = data['question1'].str.len()
+    median = data["q1_len"].median()
+    iqr = data["q1_len"].quantile(0.75)- data["q1_len"].quantile(0.25)
+    data['q1_len'] = (data["q1_len"]-median)/iqr
+
+    data['q2_len'] = data['question2'].str.len()
+    median = data["q2_len"].median()
+    iqr = data["q2_len"].quantile(0.75)- data["q2_len"].quantile(0.25)
+    data['q2_len'] = (data["q2_len"]-median)/iqr
+
+    # Question Length
+    data["q1_num_words"] = data["question1"].apply(lambda row: len(row.split(" ")))
+    median = data["q1_num_words"].median()
+    iqr = data["q1_num_words"].quantile(0.75) - data["q1_num_words"].quantile(0.25)
+    data['q1_num_words'] =  (data["q1_num_words"]-median)/iqr
+
+
+    data["q2_num_words"] = data["question2"].apply(lambda row: len(row.split(" ")))
+    median = data["q2_num_words"].median()
+    iqr = data["q2_num_words"].quantile(0.75) - data["q2_num_words"].quantile(0.25)
+    data['q2_num_words'] =  (data["q2_num_words"]-median)/iqr
+
+
+
+    # Number of common words
+    data['word_common']= data.apply(CommonWords,axis=1)
+    median = data['word_common'].median()
+    iqr = data['word_common'].quantile(0.75) - data['word_common'].quantile(0.25)
+    data['word_common'] =  (data['word_common']-median)/iqr
+
+    # Total number of words
+    data['total_words']= data.apply(total_words,axis=1)
+    median = data['total_words'].median()
+    iqr = data['total_words'].quantile(0.75) - data['total_words'].quantile(0.25)
+    data['total_words'] =  (data['total_words']-median)/iqr
+
+
+
+    # Word share
+    data['word_share']= round(data['word_common']/data['total_words'],2)
+
+    return data
+
+"""**Advance Feature Implementaion**"""
+
+def apply_advance_feature(data):
+    data['fuzz_ratio'] = data.apply(lambda row: fuzz.ratio(row['question1'], row['question2']), axis=1)/100
+    data['fuzz_partial_ratio'] = data.apply(lambda row: fuzz.partial_ratio(row['question1'], row['question2']), axis=1)/100
+    data['fuzz_token_sort_ratio'] = data.apply(lambda row: fuzz.token_sort_ratio(row['question1'], row['question2']), axis=1)/100
+    data['fuzz_token_set_ratio'] = data.apply(lambda row: fuzz.token_set_ratio(row['question1'], row['question2']), axis=1)/100
+
+    token_features = data.apply(fetch_token_features, axis=1)
+
+    data["cwc_min"]       = list(map(lambda x: x[0], token_features))
+    data["cwc_max"]       = list(map(lambda x: x[1], token_features))
+    data["csc_min"]       = list(map(lambda x: x[2], token_features))
+    data["csc_max"]       = list(map(lambda x: x[3], token_features))
+    data["ctc_min"]       = list(map(lambda x: x[4], token_features))
+    data["ctc_max"]       = list(map(lambda x: x[5], token_features))
+    data["last_word_eq"]  = list(map(lambda x: x[6], token_features))
+    data["first_word_eq"] = list(map(lambda x: x[7], token_features))
+
+    return data
+
+def appy_nlp_features(data):
+    data_1 = apply_basic_feature(data)
+    data_2 = apply_advance_feature(data_1)
+    return data_2
+
+data
+
+combined_question = pd.DataFrame()
+combined_question['question']= pd.concat([data['question1'], data['question2']], axis=0).reset_index(drop=True)
+display(combined_question)
+
+np.unique(combined_question['question'].astype(str)).shape[0]
+
+x = combined_question.value_counts() > 1
+x[x].shape[0]
+
+import string
+exclude = string.punctuation
+
+def remove_punc(text):
+  return text.translate(str.maketrans('','',exclude))
+
+combined_question['question'].apply(lambda x: remove_punc(str(x)))
+
+from nltk.stem import PorterStemmer
+ps = PorterStemmer()
+
+# Using Stemming
+combined_question['question'] = combined_question['question'].apply(lambda x: " ".join([ps.stem(word) for word in str(x).split()]))
+
+combined_question['question']
+
+"""**Apply CountVectorizer (Bag of Words)**"""
+
+from sklearn.feature_extraction .text import CountVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+
+cv = CountVectorizer(max_features=3000)
+transformed = cv.fit_transform(combined_question['question']).toarray()
+
+transformed
+
+ques1_arr,ques2_arr = np.vsplit(transformed,2)
+
+temp_df1 = pd.DataFrame(ques1_arr)
+temp_df1.index = data.index
+
+temp_df2 = pd.DataFrame(ques2_arr)
+temp_df2.index = data.index
+
+temp_df = pd.concat([temp_df1, temp_df2], axis=1)
+temp_df
+
+data = appy_nlp_features(data)
+
+feature_data = data.drop(columns=['id', 'qid1', 'qid2', 'is_duplicate', 'question1', 'question2'])
+feature_data
+
+res_df = pd.concat([temp_df, feature_data], axis=1)
+res_df
+
+X_train,X_test,y_train,y_test = train_test_split(res_df.iloc[:,0:-1].values,
+                                                 res_df.iloc[:,-1].values,
+                                                 test_size=0.2,
+                                                 random_state=1)
+
+X_train.shape,X_test.shape,y_train.shape,y_test.shape
+
+from sklearn.impute import SimpleImputer
+
+# Replace infinite values with NaN
+X_train[np.isinf(X_train)] = np.nan
+X_test[np.isinf(X_test)] = np.nan
+
+# Impute NaN values with the mean of the respective column
+imputer = SimpleImputer(strategy='mean')
+X_train = imputer.fit_transform(X_train)
+X_test = imputer.transform(X_test)
+
+rf = RandomForestClassifier()
+rf.fit(X_train,y_train)
+
+y_pred = rf.predict(X_test)
+accuracy_score(y_test,y_pred)
+
+import joblib
+joblib.dump(rf, 'model.joblib')
+
+joblib.dump(cv, 'vectorizer.joblib')
+
+from google.cloud import storage
+import os
+import google.auth
+
+# Configuration
+project_id = 'gpeg-camps-platform'
+bucket_name = 'ml-model-bucket-test'
+
+# 1. Obtain OAuth2 credentials for GCS
+creds, _ = google.auth.default()
+
+# 2. Initialize the Storage Client
+storage_client = storage.Client(project=project_id, credentials=creds)
+
+def upload_to_gcs(bucket_name, source_file, destination_blob):
+    if not os.path.exists(source_file):
+        print(f"Error: {source_file} not found locally. Please run the cell that generates the file first.")
+        return
+
+    try:
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob)
+
+        print(f"Uploading {source_file} to gs://{bucket_name}/{destination_blob}...")
+        blob.upload_from_filename(source_file)
+        print("Upload complete.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# 3. Execute upload
+source_file_name = 'vectorizer.joblib'
+destination_blob_name = 'vectorizer.joblib'
+
+upload_to_gcs(bucket_name, source_file_name, destination_blob_name)
+
+source_file_name = 'model.joblib'
+destination_blob_name = 'model.joblib'
+
+upload_to_gcs(bucket_name, source_file_name, destination_blob_name)
