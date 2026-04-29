@@ -11,7 +11,7 @@ app = FastAPI(title="ML Model API")
 # --- CONFIGURATION ---
 MODEL_PATH = 'model.joblib'
 VECTORIZER_PATH = 'vectorizer.joblib'
-BUCKET_NAME = 'dk-ml-model-bucket'
+BUCKET_NAME = 'ml-model-bucket-test'
 
 # --- MODELS & GLOBALS ---
 model = None
